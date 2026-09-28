@@ -75,16 +75,16 @@ resource "aws_security_group" "security-group" {
   # Ingress rules to allow traffic on specified ports
   ingress = [
     # Loop through a list of ports and define rules for each
-    for port in [22, 8080, 9000, 9090, 80] : {
-      description      = "TLS from VPC"  # Description for the rule
+    for port in [22, 8080, 9000] : {
+      description      = "Admin access from my IP only"  # Description for the rule
       from_port        = port           # Port range for ingress
       to_port          = port           # Port range for ingress
       protocol         = "tcp"          # TCP protocol
-      ipv6_cidr_blocks = ["::/0"]       # Allow traffic from all IPv6 addresses
+      ipv6_cidr_blocks = []       # Allow traffic from all IPv6 addresses
       self             = false          # Do not allow traffic from the instance itself
       prefix_list_ids  = []             # No prefix lists
       security_groups  = []             # No additional security groups
-      cidr_blocks      = ["0.0.0.0/0"]  # Allow traffic from any IPv4 address
+      cidr_blocks      = [var.allowed_cidr]
     }
   ]
 

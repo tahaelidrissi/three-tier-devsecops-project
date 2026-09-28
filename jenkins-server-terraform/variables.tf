@@ -60,3 +60,8 @@ variable "iam_role_name" {
   description = "The IAM role name for jenkins instance."
   default     = "jenkins-server-iam-role"
 }
+
+variable "allowed_cidr" {
+  description = "Only this IP range can reach SSH, Jenkins and SonarQube (e.g. 1.2.3.4/32)."
+  type        = string
+}
