@@ -12,7 +12,7 @@ pipeline {
         REPOSITORY_URI     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
         GIT_REPO_NAME      = 'three-tier-devsecops-project'
         GIT_USER_NAME      = 'tahaelidrissi'
-        GIT_USER_EMAIL     = 'tahaibourkidrissi@gmail.com'
+        GIT_USER_EMAIL     = 'tahaidrissi0525@gmail.com'
     }
     stages {
         stage('Cleaning Workspace') {

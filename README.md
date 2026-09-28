@@ -7,7 +7,7 @@
 ![Security](https://img.shields.io/badge/DevSecOps-SonarQube%20%7C%20OWASP%20%7C%20Trivy-2E8B57)
 ![Monitoring](https://img.shields.io/badge/Monitoring-Prometheus%20%7C%20Grafana-E6522C)
 
-End-to-end DevSecOps deployment of a three-tier notes application (React frontend, Node.js API, PostgreSQL) on Amazon EKS:
+End-to-end DevSecOps deployment of a three-tier notes application (React frontend, Django REST API, PostgreSQL) on Amazon EKS:
 Jenkins CI with security scanning, images pushed to Amazon ECR, GitOps delivery with ArgoCD, and cluster monitoring with Prometheus and Grafana.
 
 This is a hands-on learning project based on the
@@ -32,7 +32,7 @@ Developer ── git push ──► GitHub (this repo = source of truth)
                              ▼
      Amazon EKS ── namespace three-tier ───────────────────────
        ALB Ingress ──  /     ──► frontend (React)
-                   └─  /api  ──► backend (Node.js) ──► PostgreSQL
+                   └─  /api  ──► backend (Django)  ──► PostgreSQL
      Prometheus + Grafana (namespace monitoring)
 ```
 
@@ -40,7 +40,7 @@ Developer ── git push ──► GitHub (this repo = source of truth)
 
 | Path | Purpose |
 | --- | --- |
-| `app-code/` | Application source: React frontend and Node.js backend |
+| `app-code/` | Application source: React frontend and Django (Python) backend |
 | `jenkins-server-terraform/` | Terraform for the Jenkins server (VPC, EC2, IAM role, bootstrap script) |
 | `jenkins-pipeline/` | Jenkinsfiles for the backend and frontend pipelines |
 | `kubernetes-manifests/` | Kubernetes objects: database, backend, frontend, ingress |
@@ -67,10 +67,11 @@ Problems discovered while preparing the project, fixed **before** any billable r
 
 | # | Issue | Impact if left as is | Fix |
 | --- | --- | --- | --- |
-| 1 | Backend `env` list referenced `$(POSTGRES_PASSWORD)` before defining it | API cannot connect to PostgreSQL, 502 errors on `/api` | Reordered the `env` list ([details](#5-bug-fixed-environment-variable-order-in-the-backend-deployment)) |
+| 1 | Backend `env` list referenced `$(POSTGRES_PASSWORD)` before defining it | `POSTGRES_CONN_STR` held the literal text instead of the password (latent bug: Django does not read this variable today) | Reordered the `env` list ([details](#5-latent-bug-fixed-environment-variable-order-in-the-backend-deployment)) |
 | 2 | Jenkins security group open to `0.0.0.0/0` on 5 ports, on an instance with `AdministratorAccess` | An exposed Jenkins could lead to a full AWS account takeover | 3 ports, single allowed IP ([details](#8-hardening-the-jenkins-security-group)) |
 | 3 | Broken `.gitignore` rule (`.pem*.pem`) | Private SSH key committed to a public repository | Fixed and verified with `git check-ignore` ([details](#6-protecting-secrets-from-git)) |
 | 4 | Default PostgreSQL password from the tutorial | Publicly known credential | Random password ([details](#4-repository-configuration)) |
+| 5 | Backend `requirements.txt` listed ~150 packages (pandas, transformers, Selenium, Scrapy…) while the code only imports 5 | Multi-GB image, slow builds billed by the hour, hundreds of irrelevant CVEs in Trivy/OWASP reports | Trimmed to the 5 packages actually used |
 
 Fixes inherited from the original tutorial (Jenkins 2026 repository key, Java 21, `postgres:16`, cost reductions…) are listed in [`CHANGES.md`](CHANGES.md).
 
@@ -135,7 +136,7 @@ The script points the Jenkinsfiles, ArgoCD Applications, image references and Te
 **Database credentials.** The default PostgreSQL password from the tutorial was replaced with a randomly generated one (`openssl rand -hex 12`), base64-encoded in `kubernetes-manifests/database/secrets.yaml`.
 Base64 is an encoding, not encryption: this is acceptable here only because the database is exposed through a `ClusterIP` service and is unreachable from the internet. In production, the secret would come from AWS Secrets Manager (External Secrets Operator) or Sealed Secrets.
 
-### 5. Bug fixed: environment variable order in the backend Deployment
+### 5. Latent bug fixed: environment variable order in the backend Deployment
 
 In `kubernetes-manifests/backend/deployment.yaml`, the connection string was declared **before** the variables it references:
 
@@ -147,7 +148,9 @@ env:
   ...
 ```
 
-Kubernetes only expands `$(VAR)` when `VAR` is defined **earlier in the same list**; otherwise the literal text is kept. The API would have received `$(POSTGRES_PASSWORD)` as its password and failed with 502 errors on `/api`.
+Kubernetes only expands `$(VAR)` when `VAR` is defined **earlier in the same list**; otherwise the literal text is kept, so `POSTGRES_CONN_STR` contained `$(POSTGRES_PASSWORD)` instead of the real password.
+
+On closer inspection, the Django backend does not read `POSTGRES_CONN_STR` at all: `core/settings.py` builds the connection from `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `POSTGRES_DB` directly. The bug is therefore **latent**: harmless today, but any code relying on the connection string would break silently.
 Fix: `POSTGRES_CONN_STR` moved to the end of the `env` list, after `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` and `POSTGRES_DB`.
 
 ### 6. Protecting secrets from Git
