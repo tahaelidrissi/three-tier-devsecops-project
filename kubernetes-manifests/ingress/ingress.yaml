@@ -1,0 +1,32 @@
+# One ALB for the whole app (no domain needed):
+#   http://<alb-dns>/      -> frontend
+#   http://<alb-dns>/api   -> backend (the React app calls /api/notes/ on the same host)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: three-tier-ingress
+  namespace: three-tier
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000
