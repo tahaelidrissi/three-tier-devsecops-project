@@ -61,6 +61,19 @@ AWS bills by the hour, and the EKS control plane is the most expensive piece. Th
 
 Main savings: Spot worker nodes, no NAT Gateway, a single ALB for the whole app, `kubectl port-forward` instead of extra load balancers, and a smaller Jenkins instance.
 
+## Issues found and fixed
+
+Problems discovered while preparing the project, fixed **before** any billable resource was created:
+
+| # | Issue | Impact if left as is | Fix |
+| --- | --- | --- | --- |
+| 1 | Backend `env` list referenced `$(POSTGRES_PASSWORD)` before defining it | API cannot connect to PostgreSQL, 502 errors on `/api` | Reordered the `env` list ([details](#5-bug-fixed-environment-variable-order-in-the-backend-deployment)) |
+| 2 | Jenkins security group open to `0.0.0.0/0` on 5 ports, on an instance with `AdministratorAccess` | An exposed Jenkins could lead to a full AWS account takeover | 3 ports, single allowed IP ([details](#8-hardening-the-jenkins-security-group)) |
+| 3 | Broken `.gitignore` rule (`.pem*.pem`) | Private SSH key committed to a public repository | Fixed and verified with `git check-ignore` ([details](#6-protecting-secrets-from-git)) |
+| 4 | Default PostgreSQL password from the tutorial | Publicly known credential | Random password ([details](#4-repository-configuration)) |
+
+Fixes inherited from the original tutorial (Jenkins 2026 repository key, Java 21, `postgres:16`, cost reductions…) are listed in [`CHANGES.md`](CHANGES.md).
+
 ## Progress
 
 - [x] **Phase 0** — local preparation (see below)
@@ -168,10 +181,6 @@ terraform init && terraform validate && terraform plan
 
 Storing the state remotely means `terraform destroy` can always find every resource it created, even if the local machine is lost.
 
-**Exit criteria for Phase 0:** `terraform plan` shows the resources to create with no errors.
-
----
-
 ### 8. Hardening the Jenkins security group
 
 The original Terraform opened ports 22, 80, 8080, 9000 and 9090 to the whole internet (`0.0.0.0/0` and `::/0`),
@@ -186,6 +195,29 @@ terraform plan
 ```
 
 The IP is never written to the repository. If it changes, re-running `terraform apply` updates the security group in place.
+
+> Consumer VPNs such as Cloudflare WARP change the public egress IP, so they are disabled during AWS sessions to keep the allowed IP valid.
+
+### 9. Git hygiene
+
+- **Commit identity.** Commits made before `user.email` was configured used a machine-generated address (`user@hostname.localdomain`) and were not linked to the GitHub profile. The identity was set to the e-mail registered on GitHub, and the author of every commit was rewritten:
+
+  ```bash
+  git config --global user.email "<email-registered-on-github>"
+  git rebase -r --root --exec "git commit --amend --no-edit --reset-author"
+  git push --force-with-lease
+  ```
+
+- **`--force-with-lease` instead of `--force`.** The first forced push was rejected (`stale info`) because a commit had been made from the GitHub web UI in the meantime. Unlike `--force`, `--force-with-lease` refuses to overwrite remote work it has not seen. After `git fetch` and a review with `git diff --stat origin/main main`, the push went through safely.
+- **Rules kept for the rest of the project:** always `git pull` after editing on github.com, and never rewrite the history of a shared branch.
+
+### Phase 0 outcome
+
+- `terraform plan`: **12 resources to add, 0 errors**; the S3 state lock is acquired and released correctly.
+- Repository configured, documented and pushed; no secret committed.
+- AWS cost so far: **~$0** (only an almost empty S3 bucket).
+
+---
 
 ## Credits
 
