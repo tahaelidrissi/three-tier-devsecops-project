@@ -9,7 +9,7 @@ venv
 /jenkins-server-terraform/.terraform
 
 notes.txt
-.pem*.pem
+*.pem
 .terraform/
 *.tfstate*
 .terraform.lock.hcl.bak
