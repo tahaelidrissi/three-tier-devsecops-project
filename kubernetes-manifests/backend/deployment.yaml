@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
       - name: api
-        image: 481879233905.dkr.ecr.us-west-2.amazonaws.com/backend:1
+        image: 481879233905.dkr.ecr.us-west-2.amazonaws.com/backend:2
         imagePullPolicy: Always
         env:
           - name: POSTGRES_USERNAME
