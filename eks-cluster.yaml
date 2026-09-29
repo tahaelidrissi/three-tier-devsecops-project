@@ -1,4 +1,4 @@
-# Minimal-cost EKS cluster: Spot nodes, no NAT Gateway (nodes in public subnets), OIDC on.
+# Minimal-cost EKS cluster: free-plan eligible on-demand nodes, no NAT Gateway (nodes in public subnets), OIDC on.
 # Create:  eksctl create cluster -f eks-cluster.yaml
 # Delete:  eksctl delete cluster -f eks-cluster.yaml --disable-nodegroup-eviction --wait
 apiVersion: eksctl.io/v1alpha5
@@ -12,9 +12,9 @@ vpc:
   nat:
     gateway: Disable
 managedNodeGroups:
-  - name: spot-ng
-    instanceTypes: ["t3.medium", "t3a.medium", "t3.large", "t3a.large"]
-    spot: true
+  - name: ng-1
+    instanceTypes: ["m7i-flex.large"]
+    spot: false
     minSize: 2
     maxSize: 2
     desiredCapacity: 2
