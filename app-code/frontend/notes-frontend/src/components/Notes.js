@@ -76,7 +76,7 @@ const Notes = () => {
                     </Box>
                     <Box flex={1}>
                         <Typography variant="h4" gutterBottom sx={{ textAlign: 'center', marginBottom: 4 }}>
-                            Notes List
+                            Notes List — deployed by ArgoCD (GitOps)
                         </Typography>
                         <Grid container spacing={3}>
                             {notes.map((note) => (
