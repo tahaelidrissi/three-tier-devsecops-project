@@ -45,7 +45,7 @@ Developer ── git push ──► GitHub (this repo = source of truth)
 | `jenkins-pipeline/` | Jenkinsfiles for the backend and frontend pipelines |
 | `kubernetes-manifests/` | Kubernetes objects: database, backend, frontend, ingress |
 | `argocd/` | Declarative ArgoCD Applications (auto-sync) |
-| `eks-cluster.yaml` | EKS cluster definition for `eksctl` (Spot nodes, no NAT Gateway) |
+| `eks-cluster.yaml` | EKS cluster definition for `eksctl` (2 on-demand `m7i-flex.large` nodes, no NAT Gateway) |
 | `configure.sh` | Replaces every `__PLACEHOLDER__` with account-specific values |
 | `CHANGES.md` | Fixes and cost optimizations compared to the original tutorial |
 
@@ -57,13 +57,14 @@ AWS bills by the hour, and the EKS control plane is the most expensive piece. Th
 | --- | --- | --- | --- |
 | Phase 0 — local preparation | Nothing (S3 state bucket only) | ~$0 | ~$0 |
 | Session 1 — CI | Jenkins EC2 only | ~$0.30 | ~$0.40 (≈4 h, see below) |
-| Session 2 — CD & monitoring | Jenkins + EKS + 1 ALB, destroyed the same day | ~$1–1.50 | — |
+| Session 2 — CD & monitoring | Jenkins + EKS + 1 ALB, destroyed the same day | ~$1–1.50 | ~$0.70 (≈1 h 15 of cluster, see below) |
+| **Total** | | **~$2–5** | **≈ $1.20** |
 
-Main savings: Spot worker nodes, no NAT Gateway, a single ALB for the whole app, `kubectl port-forward` instead of extra load balancers, and a smaller Jenkins instance.
+Main savings: the cluster only exists for about an hour, no NAT Gateway, a single ALB for the whole app, `kubectl port-forward` instead of extra load balancers, and a smaller Jenkins instance.
 
 ## Issues found and fixed
 
-Problems discovered while preparing (Phase 0) and running (Session 1) the project:
+Problems discovered while preparing (Phase 0) and running (Sessions 1 and 2) the project:
 
 | # | Issue | Impact if left as is | Fix |
 | --- | --- | --- | --- |
@@ -75,6 +76,8 @@ Problems discovered while preparing (Phase 0) and running (Session 1) the projec
 | 6 | Frontend `Dockerfile` copied only `package.json` and ran `npm install` | Non-reproducible build: a newer transitive `eslint-plugin-jest` broke `react-scripts build` (`Environment key "jest/globals" is unknown`) | `COPY package-lock.json` + `npm ci` ([details](#frontend-build-failure-non-reproducible-dependencies)) |
 | 7 | Jenkinsfiles interpolate secrets in Groovy strings (`"--nvdApiKey ${NVD_API_KEY}"`) | Masked in Jenkins logs, but the NVD key is visible in clear text in the server process list (`ps`) | **Open** — to fix with single-quoted `sh` / environment variables; key to be rotated ([details](#secrets-interpolated-in-groovy-strings-open)) |
 | 8 | Local network only allowed outbound HTTPS (ports 22, 80 and 8080 blocked) | No SSH and no access to Jenkins/SonarQube from that network | SSH tunnel from an unrestricted network; AWS Systems Manager (HTTPS-only) as the long-term option ([details](#restricted-network-only-https-allowed)) |
+| 9 | `eks-cluster.yaml` requested Spot `t3.medium`/`t3.large` nodes | On an AWS **Free plan** account only a few instance types are allowed: the node group would have failed mid-creation | 2 on-demand `m7i-flex.large` nodes ([details](#1-checking-that-eks-is-allowed-on-a-free-plan-account)) |
+| 10 | No `resources.requests`/`limits` on any Deployment | The scheduler cannot place pods reliably and one pod can starve its neighbours (visible in Grafana: *CPU Throttling — No data*) | **Open** — see [Next steps](#next-steps) |
 
 Fixes inherited from the original tutorial (Jenkins 2026 repository key, Java 21, `postgres:16`, cost reductions…) are listed in [`CHANGES.md`](CHANGES.md).
 
@@ -82,8 +85,10 @@ Fixes inherited from the original tutorial (Jenkins 2026 repository key, Java 21
 
 - [x] **Phase 0** — local preparation (see below)
 - [x] **Session 1** — Jenkins, SonarQube and CI pipelines, images in ECR (see below)
-- [ ] **Session 2** — EKS, AWS Load Balancer Controller, ArgoCD, Prometheus/Grafana
-- [ ] **Cleanup** — zero resources left
+- [x] **Session 2** — EKS, AWS Load Balancer Controller, ArgoCD, Prometheus/Grafana (see below)
+- [x] **Cleanup** — zero resources left
+
+> **Status:** project completed on 29 September 2026. All AWS resources have been destroyed.
 
 ---
 
@@ -355,6 +360,185 @@ Working from another network (with `terraform apply` to update the allowed IP) s
 - 2 green pipelines, 2 images in ECR, 2 GitOps commits by Jenkins.
 - Instance **stopped** at the end of the session: Jenkins configuration, credentials, SonarQube data and the NVD cache persist on the 30 GB disk (~$0.08/day). The public IP changes on restart.
 - AWS cost: **~$0.40** (about 4 hours of `m7i-flex.large`), paid by credits.
+
+---
+
+## Session 2 — EKS, ArgoCD and monitoring
+
+Goal: run the application on Amazon EKS behind an ALB, deployed by ArgoCD from this repository, monitored with Prometheus and Grafana, and destroy everything the same day.
+
+**Result:** ✅ application online, 4 ArgoCD Applications *Synced / Healthy*, GitOps demo recorded (code change → Jenkins → new image tag → ArgoCD → rolling update), Grafana dashboards, and a complete cleanup.
+
+All cluster commands run **on the Jenkins server**, which already has `kubectl`, `eksctl` and `helm`, and uses its IAM role (no access key).
+
+### 1. Checking that EKS is allowed on a Free plan account
+
+The account is on the AWS **Free plan** (no card charges, credits only). The documentation does not clearly list EKS as blocked, so it was tested directly with a bare control plane (no nodes), deleted as soon as it became active:
+
+```bash
+aws eks create-cluster --name eks-free-plan-test --role-arn <test-role> \
+  --resources-vpc-config subnetIds=<2 default subnets> --query cluster.status   # → CREATING
+aws eks wait cluster-active  --name eks-free-plan-test && aws eks delete-cluster --name eks-free-plan-test
+```
+
+Cost of the test: a few cents. **EKS works on the Free plan**, but EC2 is restricted to a few instance types (`t3.micro`, `t3.small`, `t4g.micro`, `t4g.small`, `c7i-flex.large`, `m7i-flex.large`).
+The original node group (Spot `t3.medium`/`t3.large`) was therefore replaced **before** creating the cluster:
+
+```yaml
+managedNodeGroups:
+  - name: ng-1
+    instanceTypes: ["m7i-flex.large"]   # 2 vCPU, 8 GiB, Free-plan eligible
+    spot: false
+    desiredCapacity: 2
+```
+
+### 2. Creating the cluster
+
+```bash
+tmux new -s eks                      # survives an SSH disconnection
+eksctl create cluster -f eks-cluster.yaml
+```
+
+`eksctl` generated two CloudFormation stacks and the cluster was ready in **16 minutes**:
+
+| Component | Details |
+| --- | --- |
+| VPC | Dedicated `192.168.0.0/16`, public and private subnets in 3 AZs, **no NAT Gateway** (nodes in public subnets) |
+| Control plane | Kubernetes **1.34**, managed by AWS |
+| Add-ons | `vpc-cni` (pods get VPC IPs), `kube-proxy`, `coredns`, `metrics-server` |
+| IAM OIDC provider | Enables IRSA: pods get AWS permissions through a Kubernetes service account, without access keys |
+| Node group | 2 × `m7i-flex.large`, Amazon Linux 2023, containerd |
+
+> `eksctl` warns that OIDC is disabled when it creates the `vpc-cni` add-on: this is only an ordering message, the provider is associated right after. Verified with `aws eks describe-cluster --query cluster.identity.oidc.issuer`.
+
+### 3. AWS Load Balancer Controller
+
+The controller watches `Ingress` objects and creates the corresponding **Application Load Balancer**. Its IAM policy must match the installed version, so the version is read from the Helm chart first:
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts && helm repo update
+LBC_VERSION=$(helm search repo eks/aws-load-balancer-controller -o json | jq -r '.[0].app_version')   # v3.5.0
+curl -fsSL -o iam_policy.json \
+  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/${LBC_VERSION}/docs/install/iam_policy.json
+aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam_policy.json
+
+eksctl create iamserviceaccount --cluster $CLUSTER --namespace kube-system \
+  --name aws-load-balancer-controller --role-name AmazonEKSLoadBalancerControllerRole \
+  --attach-policy-arn arn:aws:iam::$ACCOUNT_ID:policy/AWSLoadBalancerControllerIAMPolicy --approve
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system \
+  --set clusterName=$CLUSTER --set region=$REGION --set vpcId=$VPC_ID \
+  --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller
+```
+
+A mismatched policy is one of the most common failures of this setup: the controller starts, then fails with `AccessDenied` when it tries to create the ALB.
+
+### 4. ArgoCD and GitOps deployment
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl apply -f argocd/          # 4 Applications: database, backend, frontend, ingress
+```
+
+- `--server-side` is required because some ArgoCD CRDs are too large for a client-side `kubectl apply`.
+- Each Application points to a folder of `kubernetes-manifests/` in this repository, with `automated`, `prune` and `selfHeal`: Git is the single source of truth, manual changes in the cluster are reverted.
+- ArgoCD deployed PostgreSQL, the Django API (2 replicas, image `backend:2`), the React frontend (`frontend:3`) and the Ingress. The `api` pods restarted once or twice at startup because they started before PostgreSQL was ready, then stabilised.
+- The ArgoCD UI is **not exposed**: it is reached with `kubectl port-forward` on the server, through the SSH tunnel.
+
+**One ALB for the whole application** (`kubernetes-manifests/ingress/ingress.yaml`, `target-type: ip`):
+
+| Path | Service | Check |
+| --- | --- | --- |
+| `/` | `frontend:3000` (React) | `HTTP 200` |
+| `/api` | `api:8000` (Django REST) | `GET /api/notes/` → `HTTP 200 []` |
+
+All ALB targets (the pod IPs) were `healthy`. Creating a note in the browser and reloading the page confirmed that the three tiers communicate (frontend → API → PostgreSQL).
+
+### 5. GitOps demo: from `git push` to production
+
+1. Change the page title in `app-code/frontend/notes-frontend/src/components/Notes.js`, commit and push.
+2. Run the `frontend` pipeline: SonarQube, OWASP (NVD cache reused), Trivy, build, push `frontend:4` to ECR.
+3. Jenkins commits `ci(frontend): deploy image 4` to `kubernetes-manifests/frontend/deployment.yaml`.
+4. ArgoCD detects the commit (polling every 3 minutes, or *Refresh*) and performs a rolling update.
+5. The new title *"Notes List — deployed by ArgoCD (GitOps)"* is live, with the existing notes still stored in PostgreSQL.
+
+**No `kubectl apply` was run for this deployment**: the cluster only follows Git.
+
+> The pipeline itself is started manually. An automatic trigger is a planned improvement (see [Next steps](#next-steps)): it must be restricted to each app's folder, otherwise Jenkins would be re-triggered by its own `ci(...)` commit and loop forever.
+
+### 6. Monitoring with Prometheus and Grafana
+
+```bash
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace --set alertmanager.enabled=false
+```
+
+- **Prometheus** scrapes node-exporter (one per node), kube-state-metrics, the kubelets and the API server every 30 s. All targets were *UP*.
+- **Grafana** ships with ready-made dashboards: *Kubernetes / Compute Resources / Namespace (Pods)* for `three-tier`, *Cluster*, and *Node Exporter / Nodes*.
+- A small load test through the ALB (GET `/`, GET and POST `/api/notes/` in a loop for 3 minutes) made the `api` CPU rise from ~0 to **~40 millicores**: the Django API is very light.
+- *CPU Throttling* showed *No data* because no CPU limits are defined on the containers (issue #10).
+- Both UIs were reached with `kubectl port-forward` through the SSH tunnel: **no extra load balancer**.
+
+PromQL queries used:
+
+```promql
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="three-tier"}[2m]))
+sum by (pod) (container_memory_working_set_bytes{namespace="three-tier", container!=""})
+kube_pod_container_status_restarts_total{namespace="three-tier"}
+```
+
+### 7. Problems met during Session 2
+
+- **Browser DNS cache.** The ALB was opened in the browser before its DNS name existed; the browser cached the failure (`DNS_PROBE_POSSIBLE`) while `curl` from the server already returned `200`. Fixed by clearing the browser host cache and `ipconfig /flushdns`. Lesson: test from the server first (`getent hosts`, `curl -w %{http_code}`, target health) before blaming the application.
+- **A misleading network test.** A connectivity check that searched for a text string in a web page reported ports as blocked when they were not; checking the HTTP status code (`curl -w "%{http_code}"`) gave the right answer.
+- **tmux habits.** Long-running commands (`eksctl`, `kubectl port-forward`) were run in separate tmux windows so that an SSH disconnection could not interrupt them.
+
+## Cleanup
+
+The order matters:
+
+1. **Delete the ArgoCD Applications first.** With `selfHeal: true`, ArgoCD would immediately recreate a manually deleted Ingress, and the ALB with it. Without a finalizer, deleting an Application does not delete its resources.
+2. **Delete the Ingress** → the controller deletes the ALB. Wait until `aws elbv2 describe-load-balancers` returns nothing: a remaining ALB blocks the deletion of the VPC.
+3. **Delete the cluster**, then the controller's IAM policy.
+4. **Destroy the Jenkins server**, then the ECR repositories, the key pair and the versioned state bucket (emptied first, since `aws s3 rb` does not remove object versions).
+
+```bash
+# On the Jenkins server
+kubectl delete -f argocd/
+kubectl delete ingress --all -n three-tier
+aws elbv2 describe-load-balancers --query "LoadBalancers[].LoadBalancerName"      # wait for []
+eksctl delete cluster -f eks-cluster.yaml --disable-nodegroup-eviction --wait
+aws iam delete-policy --policy-arn arn:aws:iam::<account-id>:policy/AWSLoadBalancerControllerIAMPolicy
+
+# On the workstation
+terraform destroy                                     # TF_VAR_allowed_cidr is required even to destroy
+aws ecr delete-repository --repository-name backend  --force
+aws ecr delete-repository --repository-name frontend --force
+aws ec2 delete-key-pair --key-name devsecops-project
+# S3 console: Empty, then Delete the tfstate bucket
+```
+
+A final check listed no EKS cluster, no running instance, no EBS volume, no load balancer, no Elastic IP, no `eksctl-*` CloudFormation stack, no ECR repository and no key pair; only the account's default VPC remains.
+Last step: revoke the GitHub token used by Jenkins and rotate the NVD API key.
+
+### Session 2 outcome
+
+- Application deployed on EKS by ArgoCD, reachable through a single ALB, monitored with Prometheus and Grafana.
+- Complete GitOps loop demonstrated: `git push` → Jenkins → ECR → Git commit → ArgoCD → rolling update.
+- Cluster lifetime: about **1 h 15**. AWS cost of the session: **≈ $0.70**; whole project: **≈ $1.20**, paid by credits.
+
+## Next steps
+
+- **Fix issue #7**: pass secrets to the pipelines through environment variables and single-quoted `sh` steps, then rotate the NVD key.
+- **Add `resources.requests` and `limits`** to every Deployment (issue #10), plus readiness/liveness probes for the frontend.
+- **Automatic CI trigger** with *Poll SCM* restricted to each app's folder (`app-code/frontend/**`, `app-code/backend/**`), and `poll: false` on the in-pipeline `git` step to avoid the CI-commit loop.
+- **Harden the application**: Django `SECRET_KEY` from a Kubernetes Secret, `DEBUG = False`, restricted `ALLOWED_HOSTS`, `gunicorn` instead of `runserver`, frontend base image `node:22-alpine` + static files served by nginx.
+- **Secrets management**: AWS Secrets Manager with External Secrets Operator (or Sealed Secrets) instead of base64 Secrets in Git.
+- **Persistent storage**: replace the `hostPath` PersistentVolume with a `gp3` EBS volume (EBS CSI driver), or Amazon RDS for PostgreSQL.
+- **Single IaC tool**: manage the EKS cluster with the `terraform-aws-modules/eks` module instead of `eksctl`.
+- **Access without open ports**: AWS Systems Manager Session Manager instead of SSH.
 
 ---
 
